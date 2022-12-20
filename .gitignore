@@ -1,3 +1,6 @@
+# some random test files
+src/recycle/test*
+
 # Compiled Object files
 *.slo
 *.lo

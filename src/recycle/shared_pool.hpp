@@ -147,6 +147,15 @@ public:
         return m_pool->allocate();
     }
 
+    /// @return A resource from the pool.
+    /// @param params list of parameters sent to constructor of the type of the shared pool inside
+    template<typename ...T>
+    value_ptr allocate_with(T&& ...params)
+    {
+        assert(m_pool);
+        return m_pool->allocate_with(std::forward<T>(params)...);
+    }
+
     /// @return maximum number of resources that can be unused
     std::size_t capacity() const
     {
@@ -304,6 +313,65 @@ private:
 
             return value_ptr(resource.get(), deleter(pool, resource));
         }
+       
+        // Allocates a new value from the pool constructed with parameters accepted by the inner type
+        template<typename ...T>
+        value_ptr allocate_with(T&& ...params)
+        {
+            value_ptr resource;
+
+            {
+                lock_type lock(m_mutex);
+
+                if (m_free_list.size() > 0)
+                {
+                    resource = m_free_list.back();
+                    m_free_list.pop_back();
+                    // we call the constructor of the inner type to initialize the content of the resource.
+                    // this approach allows us to create the memory footprint of value_type on the stack and then
+                    // copy construct it to the resource. This way we dont have to allocate the class on the heap.
+                    // pitfall is that if class constructor is doing any expensive allocations inside, we won't be saving any
+                    // time or space on that. So, the class itself is on stack but its elements are potentially dinamically allocated.
+                    // Tradeoff we acquire is that we can initiliaze the type any way it's parameters allow, while still
+                    // having capability to use regular allocate function that handles expensive objects that are default
+                    // constructed.
+                    *resource = value_type(std::forward<T>(params)...);
+                }
+            }
+
+            if (!resource)
+            {
+                assert(m_allocate);
+                // if this is first allocation of the object, use make shared with forwarded parameters to initialize object to what we want
+                resource = std::make_shared<value_type>(std::forward<T>(params)...);
+            }
+
+            {
+                lock_type lock(m_mutex);
+                // if the number of used_resources, summed with currently recycled ones, exceeded capacity, we will not recycle this resource. Rather we will use regular shared_pointer
+                if (m_used_resources + m_free_list.size() > m_capacity) return value_ptr(resource.get());
+                ++m_used_resources; // we increment used_resources to keep track of resources that can be returned to the pool
+            }
+
+            auto pool = impl::shared_from_this();
+
+            // Here we create a std::shared_ptr<T> with a naked
+            // pointer to the resource and a custom deleter
+            // object. The custom deleter object stores two
+            // things:
+            //
+            //   1. A std::weak_ptr<T> to the pool (used when we
+            //      need to put the resource back in the pool). If
+            //      the pool dies before the resource then we can
+            //      detect this with the weak_ptr and no try to
+            //      access it.
+            //
+            //   2. A std::shared_ptr<T> that points to the actual
+            //      resource and is the one actually keeping it alive.
+
+            return value_ptr(resource.get(), deleter(pool, resource));   
+        }
+
 
         /// @copydoc shared_pool::free_unused()
         void free_unused()
